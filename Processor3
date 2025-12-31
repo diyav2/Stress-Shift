@@ -1,0 +1,413 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks, butter, filtfilt
+from tabulate import tabulate
+
+# =========================================================
+# USER CONFIG 
+# =========================================================
+
+# --- 1) Which axes represent sagittal-plane pitch? ---
+# Default assumes:
+#   pitch_acc = atan2(ax, az)
+#   pitch_gyro = gy
+AXIS = {
+    "imu1_acc_num": "a1x",
+    "imu1_acc_den": "a1z",
+    "imu1_gyro":    "g1y",
+    "imu1_sign":    1.0,
+
+    "imu2_acc_num": "a2x",
+    "imu2_acc_den": "a2z",
+    "imu2_gyro":    "g2y",
+    "imu2_sign":    1.0,
+}
+
+# Complementary filter weighting (gyro dominates when close to 1)
+COMP_ALPHA = 0.98
+
+# Optional lowpass for dq and ddq (helps a lot at 10 Hz)
+USE_LOWPASS = True
+LP_CUTOFF_HZ = 3.0   # keep low for 10 Hz sampling
+
+
+# --- 3) Force calibration for pressure sensors ---
+# You have 2 options:
+# A) "two_point": you provide ADC at ~0N and ADC at known force (e.g., bodyweight share)
+# B) "autoscale": uses early window to scale total force to BW*g (quick but weaker)
+
+FORCE_CAL = {
+    "method": "autoscale",   # "two_point" or "autoscale"
+
+    # If method == "two_point":
+    # Force model per sensor: F = k * max(0, adc - adc0)
+    # You provide adc0_heel, adc0_toe (no load), and k_heel, k_toe (N per ADC)
+    "adc0_heel": None,
+    "adc0_toe":  None,
+    "k_heel":    None,
+    "k_toe":     None,
+
+    # If method == "autoscale":
+    # Uses first CALIB_SECONDS to scale (Fheel+Ftoe) mean to BW*g
+    "baseline_seconds": 0.5,
+    "calib_seconds":    2.0,
+}
+
+# --- 4) Stress proxy settings ---
+STRESS = {
+    "knee_moment_arm_m": 0.04,   # constant proxy moment arm (m)
+    "knee_area_m2": 432e-6,      # proxy area (m^2)
+    "smooth_window": 7,
+    "min_prom_frac": 0.2,
+}
+
+
+# =========================================================
+# Core helper functions
+# =========================================================
+
+def estimate_fs(t_s: np.ndarray) -> float:
+    dt = np.diff(t_s)
+    dt = dt[dt > 0]
+    return float(1.0 / np.median(dt)) if dt.size else 10.0
+
+def lowpass(x, fs, cutoff_hz):
+    if (not USE_LOWPASS) or cutoff_hz is None:
+        return x
+    # butterworth filtfilt (zero phase)
+    nyq = 0.5 * fs
+    wn = min(0.99, cutoff_hz / nyq)
+    if wn <= 0:
+        return x
+    b, a = butter(2, wn, btype="low")
+    return filtfilt(b, a, x)
+
+def complementary_pitch(t_s, acc_num, acc_den, gyro, alpha=0.98, sign=1.0):
+    """
+    Pitch angle estimate in radians using:
+      acc_angle = atan2(acc_num, acc_den)
+      angle[i] = alpha*(angle[i-1] + gyro*dt) + (1-alpha)*acc_angle
+    """
+    t_s = np.asarray(t_s)
+    acc_angle = np.arctan2(np.asarray(acc_num), np.asarray(acc_den)) * sign
+    gyro = np.asarray(gyro) * sign
+
+    angle = np.zeros_like(acc_angle)
+    angle[0] = acc_angle[0]
+    for i in range(1, len(angle)):
+        dt = t_s[i] - t_s[i-1]
+        if dt <= 0:
+            dt = 1e-3
+        angle[i] = alpha * (angle[i-1] + gyro[i] * dt) + (1 - alpha) * acc_angle[i]
+    return angle
+
+def detect_stress_peaks(t, tau, moment_arm, area, smoothing_window=7, min_prominence=0.2):
+    tau = np.asarray(tau)
+    # stress proxy: sigma = |(tau/moment_arm)/area|
+    F = tau / (moment_arm + 1e-12)
+    stress = np.abs(F / (area + 1e-12))
+
+    w = np.ones(int(smoothing_window)) / int(smoothing_window)
+    stress_smooth = np.convolve(stress, w, mode="same")
+
+    mx = np.max(stress_smooth) if stress_smooth.size else 0
+    thr = float(min_prominence) * mx if mx > 0 else 0
+    peaks, _ = find_peaks(stress_smooth, height=thr)
+    return stress, stress_smooth, peaks
+
+def anthropometry_from_basic_measurements(anthro):
+    """
+    Returns segment params. We mainly use shank for knee torque.
+    """
+    m1_frac = 0.105
+    m2_frac = 0.0465
+    m1 = anthro["body_weight"] * m1_frac
+    m2 = anthro["body_weight"] * m2_frac
+    l1 = anthro["thigh_length"]
+    l2 = anthro["shank_length"]
+    a1 = 0.43 * l1
+    a2 = 0.43 * l2
+    k1 = 0.322
+    k2 = 0.303
+    I1 = m1 * (k1 * l1) ** 2
+    I2 = m2 * (k2 * l2) ** 2
+    return l1, l2, a1, a2, m1, m2, I1, I2
+
+
+# =========================================================
+# Upgrade: per-sensor forces + COP + GRF moment about knee
+# =========================================================
+
+def pressure_to_forces(p1, p2, t_s, body_weight_kg, cal_cfg):
+    """
+    Convert heel/toe ADC -> forces (N).
+    p1 = heel ADC, p2 = toe ADC
+    """
+    p1 = np.asarray(p1, dtype=float)
+    p2 = np.asarray(p2, dtype=float)
+
+    fs = estimate_fs(t_s)
+
+    # Baselines (no-load offsets)
+    base_n = max(1, int(cal_cfg["baseline_seconds"] * fs))
+    heel0 = np.median(p1[:base_n])
+    toe0  = np.median(p2[:base_n])
+
+    heel_rel = np.maximum(0.0, p1 - heel0)
+    toe_rel  = np.maximum(0.0, p2 - toe0)
+
+    method = cal_cfg["method"].lower().strip()
+
+    if method == "two_point":
+        # Requires user-provided k_heel/k_toe (N per ADC)
+        if cal_cfg["k_heel"] is None or cal_cfg["k_toe"] is None:
+            raise ValueError("two_point calibration selected, but k_heel/k_toe not provided.")
+        Fh = heel_rel * float(cal_cfg["k_heel"])
+        Ft = toe_rel  * float(cal_cfg["k_toe"])
+        info = {"method": "two_point", "heel0": heel0, "toe0": toe0, "k_heel": cal_cfg["k_heel"], "k_toe": cal_cfg["k_toe"]}
+        return Fh, Ft, info
+
+    # Default: autoscale total force to BW*g over early window
+    BW_N = float(body_weight_kg) * 9.81
+    calib_n = max(base_n + 1, int(cal_cfg["calib_seconds"] * fs))
+    calib_n = min(calib_n, len(t_s))
+
+    total_rel = heel_rel[:calib_n] + toe_rel[:calib_n]
+    mean_rel = float(np.mean(total_rel)) if total_rel.size else 0.0
+    scale = (BW_N / mean_rel) if mean_rel > 1e-9 else 1.0
+
+    # Split scaled force proportionally between sensors (still preserves heel/toe distribution)
+    Fh = heel_rel * scale
+    Ft = toe_rel  * scale
+
+    info = {"method": "autoscale", "heel0": heel0, "toe0": toe0, "scale_N_per_adc": scale, "fs_est": fs}
+    return Fh, Ft, info
+
+def compute_cop_x(Fh, Ft, x_heel_m, x_toe_m):
+    """
+    1D COP along the foot (x axis along ground, positive to toes),
+    measured relative to ankle origin (x=0 at ankle).
+    """
+    Ftot = Fh + Ft
+    # avoid divide by zero
+    return np.where(Ftot > 1e-9, (Fh * x_heel_m + Ft * x_toe_m) / Ftot, 0.0)
+
+def knee_torque_knee_only(t_s, theta_shank, dq_knee, ddq_knee, Fz, x_cop, l2, a2, m2, I2):
+    """
+    Knee torque model (knee-only, upgraded GRF term):
+    tau = I2 * ddq_knee + m2*g*a2*sin(theta_shank)  -  (Fz * r_x)
+
+    Where r_x is the horizontal moment arm from knee to COP in the ground frame.
+
+    Assumptions (explicit):
+    - sagittal plane
+    - vertical GRF only
+    - knee at origin
+    - shank angle theta_shank measured from vertical (pitch-like):
+        theta = 0 => shank vertical, ankle directly below knee
+    - ankle horizontal position: ankle_x = l2 * sin(theta_shank)
+    - COP horizontal position relative ankle: x_cop (from heel/toe)
+    => knee->COP horizontal distance r_x = ankle_x + x_cop
+    """
+    g = 9.81
+    theta = np.asarray(theta_shank)
+    r_x = (l2 * np.sin(theta)) + np.asarray(x_cop)  # horizontal knee->COP moment arm
+    tau = (I2 * np.asarray(ddq_knee)) + (m2 * g * a2 * np.sin(theta)) - (np.asarray(Fz) * r_x)
+    return tau, r_x
+
+
+# =========================================================
+# Full pipeline: Nano CSV -> knee-only outputs
+# =========================================================
+
+def run_pipeline_knee_only(csv_path, anthro, foot_geom):
+    # --- Load ---
+    raw = pd.read_csv(csv_path)
+
+    required = ["t_ms",
+                "a1x","a1y","a1z","g1x","g1y","g1z",
+                "a2x","a2y","a2z","g2x","g2y","g2z",
+                "p1","p2"]
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        raise ValueError(f"CSV missing columns: {missing}")
+
+    t_ms = raw["t_ms"].to_numpy(float)
+    t_s = (t_ms - t_ms[0]) / 1000.0
+    fs = estimate_fs(t_s)
+
+    # --- Anthropometry ---
+    _, l2, _, a2, _, m2, _, I2 = anthropometry_from_basic_measurements(anthro)
+
+    # --- IMU -> segment pitch angles ---
+    # Thigh (IMU1)
+    theta_thigh = complementary_pitch(
+        t_s,
+        raw[AXIS["imu1_acc_num"]].to_numpy(float),
+        raw[AXIS["imu1_acc_den"]].to_numpy(float),
+        raw[AXIS["imu1_gyro"]].to_numpy(float),
+        alpha=COMP_ALPHA,
+        sign=float(AXIS["imu1_sign"])
+    )
+
+    # Shank (IMU2)
+    theta_shank = complementary_pitch(
+        t_s,
+        raw[AXIS["imu2_acc_num"]].to_numpy(float),
+        raw[AXIS["imu2_acc_den"]].to_numpy(float),
+        raw[AXIS["imu2_gyro"]].to_numpy(float),
+        alpha=COMP_ALPHA,
+        sign=float(AXIS["imu2_sign"])
+    )
+
+    # Knee relative angle
+    q_knee = theta_shank - theta_thigh
+
+    # Knee angular velocity (best: relative gyro)
+    g1 = raw[AXIS["imu1_gyro"]].to_numpy(float) * float(AXIS["imu1_sign"])
+    g2 = raw[AXIS["imu2_gyro"]].to_numpy(float) * float(AXIS["imu2_sign"])
+    dq_knee = g2 - g1
+
+    # Knee angular acceleration
+    ddq_knee = np.gradient(dq_knee, np.maximum(np.gradient(t_s), 1e-6))
+
+    # Optional smoothing (highly recommended at 10 Hz)
+    dq_knee_f = lowpass(dq_knee, fs, LP_CUTOFF_HZ)
+    ddq_knee_f = lowpass(ddq_knee, fs, LP_CUTOFF_HZ)
+
+    # --- Pressure -> forces ---
+    Fheel, Ftoe, cal_info = pressure_to_forces(
+        raw["p1"].to_numpy(float),
+        raw["p2"].to_numpy(float),
+        t_s,
+        body_weight_kg=float(anthro["body_weight"]),
+        cal_cfg=FORCE_CAL
+    )
+
+    Fz = Fheel + Ftoe
+
+    # --- COP ---
+    x_cop = compute_cop_x(Fheel, Ftoe, foot_geom["x_heel_m"], foot_geom["x_toe_m"])
+
+    # --- Knee torque (upgraded GRF moment using COP) ---
+    tau_knee, r_x = knee_torque_knee_only(
+        t_s=t_s,
+        theta_shank=theta_shank,
+        dq_knee=dq_knee_f,
+        ddq_knee=ddq_knee_f,
+        Fz=Fz,
+        x_cop=x_cop,
+        l2=l2,
+        a2=a2,
+        m2=m2,
+        I2=I2
+    )
+
+    # --- Stress proxy + peaks ---
+    knee_moment_arm = np.full_like(t_s, float(STRESS["knee_moment_arm_m"]))
+    knee_area = float(STRESS["knee_area_m2"])
+    knee_stress, knee_stress_smooth, knee_peaks = detect_stress_peaks(
+        t=t_s,
+        tau=tau_knee,
+        moment_arm=knee_moment_arm,
+        area=knee_area,
+        smoothing_window=STRESS["smooth_window"],
+        min_prominence=STRESS["min_prom_frac"]
+    )
+
+    out = pd.DataFrame({
+        "t (s)": t_s,
+        "theta_thigh (rad)": theta_thigh,
+        "theta_shank (rad)": theta_shank,
+        "q_knee (rad)": q_knee,
+        "dq_knee (rad/s)": dq_knee_f,
+        "ddq_knee (rad/s^2)": ddq_knee_f,
+        "p_heel_adc": raw["p1"].to_numpy(float),
+        "p_toe_adc": raw["p2"].to_numpy(float),
+        "F_heel (N)": Fheel,
+        "F_toe (N)": Ftoe,
+        "Fz (N)": Fz,
+        "x_cop_rel_ankle (m)": x_cop,
+        "r_x_knee_to_cop (m)": r_x,
+        "tau_knee (Nm)": tau_knee,
+        "knee_stress (Pa)": knee_stress,
+        "knee_stress_smooth (Pa)": knee_stress_smooth,
+        "knee_is_peak": [1 if i in set(knee_peaks) else 0 for i in range(len(t_s))]
+    })
+
+    # --- Report prints ---
+    print("\n=== PIPELINE REPORT ===")
+    print(f"CSV: {csv_path}")
+    print(f"Estimated sampling rate: {fs:.2f} Hz")
+    print(f"Calibration method: {cal_info.get('method')}")
+    if cal_info.get("method") == "autoscale":
+        print(f"heel0={cal_info['heel0']:.1f}, toe0={cal_info['toe0']:.1f}, scale={cal_info['scale_N_per_adc']:.6f} N/ADC")
+    else:
+        print(f"heel0={cal_info['heel0']:.1f}, toe0={cal_info['toe0']:.1f}, k_heel={cal_info['k_heel']}, k_toe={cal_info['k_toe']}")
+    print(f"COP geometry: x_heel={foot_geom['x_heel_m']} m, x_toe={foot_geom['x_toe_m']} m (relative ankle)")
+    print(f"Peaks detected: {len(knee_peaks)}")
+
+    print("\n=== FIRST 10 ROWS ===")
+    print(tabulate(out.head(10), headers="keys", tablefmt="fancy_grid"))
+
+    # --- Plots ---
+    plt.figure(figsize=(12, 9))
+
+    plt.subplot(4, 1, 1)
+    plt.plot(out["t (s)"], out["q_knee (rad)"], label="q_knee")
+    plt.title("Knee Kinematics (from 2 IMUs)")
+    plt.ylabel("rad")
+    plt.grid(True)
+    plt.legend()
+
+    plt.subplot(4, 1, 2)
+    plt.plot(out["t (s)"], out["Fz (N)"], label="Fz (heel+toe)")
+    plt.plot(out["t (s)"], out["x_cop_rel_ankle (m)"], label="COP x (rel ankle)")
+    plt.title("Vertical GRF + COP (from 2 pressure sensors)")
+    plt.ylabel("N / m")
+    plt.grid(True)
+    plt.legend()
+
+    plt.subplot(4, 1, 3)
+    plt.plot(out["t (s)"], out["tau_knee (Nm)"], label="tau_knee")
+    plt.title("Knee Torque (includes COP-based GRF moment)")
+    plt.ylabel("Nm")
+    plt.grid(True)
+    plt.legend()
+
+    plt.subplot(4, 1, 4)
+    plt.plot(out["t (s)"], out["knee_stress (Pa)"], alpha=0.5, label="raw stress")
+    plt.plot(out["t (s)"], out["knee_stress_smooth (Pa)"], label="smoothed stress")
+    kp = np.array(knee_peaks, dtype=int)
+    if kp.size:
+        plt.scatter(out["t (s)"].to_numpy()[kp],
+                    out["knee_stress_smooth (Pa)"].to_numpy()[kp],
+                    color="red", label="peaks")
+    plt.title("Stress Proxy + Peaks")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Pa")
+    plt.grid(True)
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    return out, knee_peaks
+
+
+if __name__ == "__main__":
+    csv_path = input("Path to Nano CSV file: ").strip()
+
+    anthro = {
+        "body_weight": float(input("Body Weight (kg): ")),
+        "thigh_length": float(input("Thigh Length (m): ")),
+        "shank_length": float(input("Shank Length (m): ")),
+    }
+
+    foot_geom = {
+    "x_heel_m": float(input("Heel sensor x from ankle (m, negative): ")),
+    "x_toe_m":  float(input("Toe sensor x from ankle (m, positive): ")),
+    }
+
+    out, knee_peaks = run_pipeline_knee_only(csv_path, anthro, foot_geom)
