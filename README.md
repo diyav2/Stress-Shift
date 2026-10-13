@@ -3,3 +3,6 @@ Rehabilitation devices (like braces or exosuits) often provide uniform support, 
 This repo will contain all my code pertaining to this project. It'll be majority Python in a Jupyter notebook, as we as some C++.
 Lots of physics, biomechanics, and statistics. 
 Have fun >:)
+
+UPDATE: FULL HACKSTER IO: https://www.hackster.io/diyavenkat12/stress-shift-an-assistive-knee-exoskeleton-359f1a
+this has all the hardware stuff too :D
