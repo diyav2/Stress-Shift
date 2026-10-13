@@ -6,3 +6,4 @@ Have fun >:)
 
 UPDATE: FULL HACKSTER IO: https://www.hackster.io/diyavenkat12/stress-shift-an-assistive-knee-exoskeleton-359f1a
 this has all the hardware stuff too :D
+UPDATE 2: My research paper and scifair board have been added!
